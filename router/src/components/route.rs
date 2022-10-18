@@ -59,7 +59,7 @@ impl RouteContext {
         let PathMatch { path, .. } = path_match;
         let RouteDefinition {
             element,
-            loader,
+            mut loader,
             action,
             ..
         } = route.key;

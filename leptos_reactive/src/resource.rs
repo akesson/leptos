@@ -200,6 +200,15 @@ where
     S: Debug + Clone + 'static,
     T: Debug + Clone + 'static,
 {
+    pub fn from_id(cx: Scope, id: ResourceId) -> Resource<S, T> {
+        Self {
+            runtime: cx.runtime,
+            id,
+            source_ty: PhantomData,
+            out_ty: PhantomData,
+        }
+    }
+
     pub fn read(&self) -> Option<T> {
         self.runtime
             .resource(self.id, |resource: &ResourceState<S, T>| resource.read())
@@ -228,6 +237,24 @@ where
             })
             .await
     }
+
+    pub fn to_future(&self, cx: Scope) -> impl Future<Output = T> {
+        use futures::FutureExt;
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let mut tx = Some(tx);
+        let res = *self;
+        create_isomorphic_effect(cx, move |_| {
+            let value = res.read();
+            if let Some(value) = value {
+                if let Some(tx) = tx.take() {
+                    _ = tx.send(value);
+                }
+            }
+        });
+        // unwrap is safe because we know we're not canceling the Future
+        rx.map(Result::unwrap)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -237,7 +264,7 @@ where
     T: Debug + Clone + 'static,
 {
     runtime: &'static Runtime,
-    pub(crate) id: ResourceId,
+    pub id: ResourceId,
     pub(crate) source_ty: PhantomData<S>,
     pub(crate) out_ty: PhantomData<T>,
 }

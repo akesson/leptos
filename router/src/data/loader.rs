@@ -1,19 +1,19 @@
-use std::{any::Any, fmt::Debug, future::Future, rc::Rc};
+use std::{any::Any, fmt::Debug, rc::Rc};
 
 use leptos::*;
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{use_location, use_params_map, use_route, ParamsMap, PinnedFuture, Url};
+use crate::use_route;
 
 // SSR and CSR both do the work in their own environment and return it as a resource
 #[cfg(not(feature = "hydrate"))]
-pub fn use_loader<T>(cx: Scope) -> Resource<(ParamsMap, Url), T>
+pub fn use_loader<S, T>(cx: Scope) -> Resource<S, T>
 where
-    T: Clone + Debug + Serialize + DeserializeOwned + 'static,
+    S: PartialEq + Debug + Clone + 'static,
+    T: Debug + Clone + Serialize + DeserializeOwned + 'static,
 {
     let route = use_route(cx);
-    let params = use_params_map(cx);
-    let loader = route.loader().clone().unwrap_or_else(|| {
+    let mut loader = route.loader().clone().unwrap_or_else(|| {
         debug_warn!(
             "use_loader() called on a route without a loader: {:?}",
             route.path()
@@ -21,38 +21,16 @@ where
         panic!()
     });
 
-    let location = use_location(cx);
-    let route = use_route(cx);
-    let url = move || Url {
-        origin: String::default(), // don't care what the origin is for this purpose
-        pathname: route.path().into(), // only use this route path, not all matched routes
-        search: location.search.get(), // reload when any of query string changes
-        hash: String::default(),   // hash is only client-side, shouldn't refire
+    let id = match loader.resource {
+        Some(id) => id,
+        None => {
+            let id = (loader.factory)(cx);
+            loader.resource = Some(id);
+            id
+        }
     };
 
-    let loader = loader.data.clone();
-
-    create_resource(
-        cx,
-        move || (params.get(), url()),
-        move |(params, url)| {
-            let loader = loader.clone();
-            async move {
-                let any_data = (loader.clone())(cx, params, url).await;
-                any_data
-                    .as_any()
-                    .downcast_ref::<T>()
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        debug_warn!(
-                            "use_loader() could not downcast to {:?}",
-                            std::any::type_name::<T>(),
-                        );
-                        panic!()
-                    })
-            }
-        },
-    )
+    Resource::from_id(cx, id)
 }
 
 // In hydration mode, only run the loader on the server
@@ -136,49 +114,32 @@ where
 
 #[derive(Clone)]
 pub struct Loader {
-    #[allow(clippy::type_complexity)]
-    #[cfg(not(feature = "hydrate"))]
-    pub(crate) data: Rc<dyn Fn(Scope, ParamsMap, Url) -> PinnedFuture<Box<dyn AnySerialize>>>,
+    pub resource: Option<ResourceId>,
+    pub factory: Rc<dyn Fn(Scope) -> ResourceId>,
+    #[cfg(feature = "ssr")]
+    pub serializer: Rc<dyn Fn(Scope, ResourceId) -> Pin<Box<dyn Future<Output = String>>>>,
 }
 
-impl Loader {
-    #[cfg(not(feature = "hydrate"))]
-    pub fn call_loader(&self, cx: Scope) -> PinnedFuture<Box<dyn AnySerialize>> {
-        let route = use_route(cx);
-        let params = use_params_map(cx).get();
-        let location = use_location(cx);
-        let url = Url {
-            origin: String::default(), // don't care what the origin is for this purpose
-            pathname: route.path().into(), // only use this route path, not all matched routes
-            search: location.search.get(), // reload when any of query string changes
-            hash: String::default(),   // hash is only client-side, shouldn't refire
-        };
-        (self.data)(cx, params, url)
-    }
-}
-
-impl<F, Fu, T> From<F> for Loader
+impl<F, S, T> From<F> for Loader
 where
-    F: Fn(Scope, ParamsMap, Url) -> Fu + 'static,
-    Fu: Future<Output = T> + 'static,
-    T: Any + Serialize + 'static,
+    F: Fn(Scope) -> Resource<S, T> + 'static,
+    S: PartialEq + Debug + Clone + 'static,
+    T: Debug + Clone + Serialize + DeserializeOwned + 'static,
 {
-    #[cfg(not(feature = "hydrate"))]
-    fn from(f: F) -> Self {
-        let wrapped_fn = move |cx, params, url| {
-            let res = f(cx, params, url);
-            Box::pin(async move { Box::new(res.await) as Box<dyn AnySerialize> })
-                as PinnedFuture<Box<dyn AnySerialize>>
-        };
-
-        Self {
-            data: Rc::new(wrapped_fn),
+    fn from(factory: F) -> Self {
+        Loader {
+            resource: None,
+            factory: Rc::new(move |cx| factory(cx).id),
+            #[cfg(feature = "ssr")]
+            serializer: Rc::new(move |cx, id| {
+                let res = Resource::<S, T>::from_id(cx, id);
+                let fut = res.to_future(cx);
+                Box::pin(async move {
+                    let val = fut.await;
+                    serde_json(&val).unwrap()
+                })
+            }),
         }
-    }
-
-    #[cfg(feature = "hydrate")]
-    fn from(f: F) -> Self {
-        Self {}
     }
 }
 
@@ -190,7 +151,7 @@ impl std::fmt::Debug for Loader {
 
 #[cfg(feature = "ssr")]
 pub async fn loader_to_json(view: impl Fn(Scope) -> String + 'static) -> Option<String> {
-    let (data, disposer) = run_scope_undisposed(move |cx| async move {
+    let (data, _, disposer) = run_scope_undisposed(move |cx| async move {
         let _shell = view(cx);
 
         let mut route = use_context::<crate::RouteContext>(cx)?;
@@ -198,10 +159,11 @@ pub async fn loader_to_json(view: impl Fn(Scope) -> String + 'static) -> Option<
         while let Some(child) = route.child() {
             route = child;
         }
-        let data = route
+        let json = route
             .loader()
             .as_ref()
-            .map(|loader| loader.call_loader(cx))?;
+            .map(|loader| loader.serializer(cx))
+            .await;
 
         data.await.serialize()
     });

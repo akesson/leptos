@@ -6,20 +6,35 @@ use leptos_router::*;
 
 use crate::api::{get_contact, get_contacts};
 
-async fn contact_list_data(_cx: Scope, _params: ParamsMap, url: Url) -> Vec<ContactSummary> {
-    log::debug!("(contact_list_data) reloading contacts");
-    get_contacts(url.search).await
+fn contact_list_data(cx: Scope) -> Resource<String, Vec<ContactSummary>> {
+    let query = use_query_map(cx);
+    create_resource(
+        cx,
+        move || query().get("q").cloned().unwrap_or_default(),
+        |search| async move {
+            log::debug!("(contact_list_data) reloading contacts");
+            get_contacts(search).await
+        },
+    )
 }
 
-async fn contact_data(_cx: Scope, params: ParamsMap, _url: Url) -> Option<Contact> {
-    log::debug!("(contact_data) reloading contact");
-    let id = params
-        .get("id")
-        .cloned()
-        .unwrap_or_default()
-        .parse::<usize>()
-        .ok();
-    get_contact(id).await
+fn contact_data(cx: Scope) -> Resource<Option<usize>, Option<Contact>> {
+    let params = use_params_map(cx);
+    create_resource(
+        cx,
+        move || {
+            params()
+                .get("id")
+                .cloned()
+                .unwrap_or_default()
+                .parse::<usize>()
+                .ok()
+        },
+        move |id| async move {
+            log::debug!("(contact_data) loading contact {id:?}");
+            get_contact(id).await
+        },
+    )
 }
 
 pub fn router_example(cx: Scope) -> Element {
@@ -69,7 +84,7 @@ pub fn router_example(cx: Scope) -> Element {
 
 #[component]
 pub fn ContactList(cx: Scope) -> Element {
-    let contacts = use_loader::<Vec<ContactSummary>>(cx);
+    let contacts = use_loader::<String, Vec<ContactSummary>>(cx);
     log::debug!("rendering <ContactList/>");
 
     view! { cx,
@@ -99,10 +114,14 @@ pub fn ContactList(cx: Scope) -> Element {
 
 #[component]
 pub fn Contact(cx: Scope) -> Element {
-    let contact = use_loader::<Option<Contact>>(cx);
+    let contact = use_loader::<Option<usize>, Option<Contact>>(cx);
 
     view! { cx,
         <div class="contact">
+            <Form>
+                <input type="hidden" name="irrelevant" value="test"/>
+                <input type="submit" value="Irrelevant button that should not reload data."/>
+            </Form>
             <Suspense fallback=move || view! { cx,  <p>"Loading..."</p> }>{
                 move || contact.read().map(|contact| contact.map(|contact| view! { cx,
                     <section class="card">
